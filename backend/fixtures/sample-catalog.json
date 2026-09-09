@@ -1,0 +1,94 @@
+{
+  "books": [
+    {
+      "id": "s001",
+      "title": "Piranesi",
+      "author": "Susanna Clarke",
+      "year": 2020,
+      "genres": [
+        "Fantasy",
+        "Mystery"
+      ],
+      "readingLevel": "advanced",
+      "pages": 272,
+      "themes": [
+        "solitude",
+        "memory",
+        "wonder"
+      ],
+      "mood": "dreamlike, quiet, strange",
+      "description": "A man lives alone in an infinite house of statues and tides, keeping careful journals of its halls. As he investigates the only other living person there, the nature of his world, and his own past, comes slowly and devastatingly clear.",
+      "similarTo": [
+        "The Starless Sea",
+        "Never Let Me Go"
+      ]
+    },
+    {
+      "id": "s002",
+      "title": "Bird by Bird",
+      "author": "Anne Lamott",
+      "year": 1994,
+      "genres": [
+        "Nonfiction",
+        "Writing"
+      ],
+      "readingLevel": "intermediate",
+      "pages": 237,
+      "themes": [
+        "craft",
+        "perfectionism",
+        "persistence"
+      ],
+      "mood": "warm, funny, encouraging",
+      "description": "A working novelist's advice on writing and on life, delivered in short, wry chapters. Famous for the \"shitty first drafts\" chapter, which has talked more people out of quitting than any pep talk.",
+      "similarTo": [
+        "On Writing"
+      ]
+    },
+    {
+      "id": "s003",
+      "title": "The Long Way to a Small Angry Planet",
+      "author": "Becky Chambers",
+      "year": 2014,
+      "genres": [
+        "Science Fiction"
+      ],
+      "readingLevel": "young-adult",
+      "pages": 441,
+      "themes": [
+        "found family",
+        "belonging",
+        "kindness"
+      ],
+      "mood": "cozy, hopeful, character-driven",
+      "description": "The patchwork crew of a tunnelling ship take a job that will keep them travelling together for a year. Very little explodes; almost everything is about how these people learn to live with one another.",
+      "similarTo": [
+        "A Psalm for the Wild-Built"
+      ]
+    },
+    {
+      "id": "s004",
+      "title": "Educated",
+      "author": "Tara Westover",
+      "year": 2018,
+      "genres": [
+        "Memoir",
+        "Nonfiction"
+      ],
+      "readingLevel": "advanced",
+      "pages": 334,
+      "themes": [
+        "family",
+        "education",
+        "autonomy"
+      ],
+      "mood": "tense, reflective, unflinching",
+      "description": "Raised by survivalists who kept her out of school, Westover teaches herself enough to reach university and then has to decide what that costs her. Content note: sustained family violence."
+    },
+    {
+      "title": "The House in the Cerulean Sea",
+      "author": "TJ Klune",
+      "description": "A by-the-book caseworker is sent to assess an orphanage of magical children and finds the life he never let himself want. Gentle, funny, and unapologetically kind."
+    }
+  ]
+}

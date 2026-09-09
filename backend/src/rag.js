@@ -3,7 +3,7 @@
  */
 
 import { generate } from './gemini.js';
-import { retrieve, toDocument } from './vectorStore.js';
+import { DEFAULT_K, retrieve } from './vectorStore.js';
 
 /**
  * Turn a follow-up like "something shorter?" into a standalone search query,
@@ -75,14 +75,21 @@ function formatContext(hits) {
  */
 export async function answer({ message, history = [], filters = {} }) {
   const searchQuery = await buildSearchQuery(message, history);
-  const hits = await retrieve(searchQuery, { k: 6, filters });
+  const hits = await retrieve(searchQuery, { k: DEFAULT_K(), filters });
+
+  // Retrieval applies a relevance floor, so an off-topic question legitimately
+  // returns nothing. Say so explicitly rather than sending an empty CATALOG
+  // block, which reads to the model like a formatting glitch.
+  const catalogBlock = hits.length
+    ? formatContext(hits)
+    : '(No catalog entry was a close enough match for this request.)';
 
   const system = `${SYSTEM_RULES}
 
 =========================
 CATALOG (the only books you may recommend)
 =========================
-${formatContext(hits)}`;
+${catalogBlock}`;
 
   const text = await generate({ system, history, message });
 
@@ -103,5 +110,3 @@ ${formatContext(hits)}`;
     })),
   };
 }
-
-export { toDocument };

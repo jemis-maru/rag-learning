@@ -64,12 +64,23 @@ function Sources({ sources, searchQuery, userMessage }) {
       <summary>Retrieved {sources.length} catalog entries →</summary>
       {rewritten && <p className="rewrite">Search query used: “{searchQuery}”</p>}
       <ol>
-        {sources.map((s) => (
-          <li key={s.id}>
-            <span className="sim">{s.similarity.toFixed(3)}</span> — {s.title} ({s.readingLevel}
-            , {s.pages}p, {s.genres.slice(0, 2).join('/')})
-          </li>
-        ))}
+        {sources.map((s) => {
+          // pages and genres are optional columns, so build the detail list from
+          // whatever this book actually has -- otherwise a sparse row renders as
+          // "(intermediate, p, )".
+          const detail = [
+            s.readingLevel,
+            s.pages ? `${s.pages}p` : null,
+            s.genres?.slice(0, 2).join('/') || null,
+          ].filter(Boolean);
+
+          return (
+            <li key={s.id}>
+              <span className="sim">{s.similarity.toFixed(3)}</span> — {s.title}
+              {detail.length ? ` (${detail.join(', ')})` : ''}
+            </li>
+          );
+        })}
       </ol>
     </details>
   );
@@ -82,12 +93,19 @@ export default function Home() {
   const [catalog, setCatalog] = useState({ count: 0, genres: [], readingLevels: [] });
   const [genre, setGenre] = useState('');
   const [readingLevel, setReadingLevel] = useState('');
+  const [health, setHealth] = useState(null);
   const endRef = useRef(null);
 
   useEffect(() => {
     fetch('/api/catalog')
       .then((r) => r.json())
       .then(setCatalog)
+      .catch(() => {});
+    // The pipeline badges report the models actually in use rather than
+    // hardcoded strings, which used to drift from backend/.env silently.
+    fetch('/api/health')
+      .then((r) => r.json())
+      .then(setHealth)
       .catch(() => {});
   }, []);
 
@@ -154,16 +172,29 @@ export default function Home() {
       <header className="masthead">
         <h1>📚 Bookworm</h1>
         <p>
-          A retrieval-augmented book recommender. Every suggestion is grounded in a{' '}
-          {catalog.count || 50}-book catalog — open “Retrieved catalog entries” under any answer to
-          see exactly what the model was given.
+          {catalog.count ? (
+            <>
+              A retrieval-augmented book recommender. Every suggestion is grounded in a{' '}
+              {catalog.count}-book catalog — open “Retrieved catalog entries” under any answer to
+              see exactly what the model was given.
+            </>
+          ) : (
+            <>
+              A retrieval-augmented book recommender. No catalog is loaded yet — upload one in the{' '}
+              <a href="/admin">admin console</a> to get started.
+            </>
+          )}
         </p>
         <div className="pipeline">
           <span>Next.js</span>
           <span>→ Express</span>
-          <span>→ gemini-embedding-001</span>
-          <span>→ cosine top-6</span>
-          <span>→ gemini-3.6-flash</span>
+          <span>→ {health?.embedModel ?? 'embeddings'}</span>
+          <span>
+            → {health?.chunks ?? 0} chunks
+            {health?.collection?.chunkStrategy ? ` (${health.collection.chunkStrategy})` : ''}
+          </span>
+          <span>→ cosine top-{health?.retrieveK ?? 6}</span>
+          <span>→ {health?.chatModel ?? 'gemini'}</span>
         </div>
       </header>
 
@@ -250,8 +281,13 @@ export default function Home() {
               <span className={`dot ${catalog.count ? 'up' : 'down'}`} />
               {catalog.count
                 ? `${catalog.count} books indexed`
-                : 'Backend unreachable — start it on :4000'}
+                : 'No catalog — upload one in the admin console'}
             </div>
+            {catalog.collection && (
+              <div className="status collection-name">
+                Serving <strong>{catalog.collection.name}</strong>
+              </div>
+            )}
           </section>
 
           <section className="card">
@@ -269,6 +305,9 @@ export default function Home() {
             <button className="reset" onClick={() => setMessages([GREETING])} disabled={busy}>
               Start a new conversation
             </button>
+            <a className="admin-link" href="/admin">
+              Admin console → upload a catalog
+            </a>
           </section>
         </aside>
       </div>

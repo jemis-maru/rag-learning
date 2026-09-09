@@ -4,6 +4,8 @@
  * RAG -- embedding text and generating an answer -- stay visible and debuggable.
  */
 
+import { recordUsage } from './middleware.js';
+
 const API_ROOT = 'https://generativelanguage.googleapis.com/v1beta/models';
 
 function apiKey() {
@@ -69,24 +71,43 @@ export async function embed(text, taskType = 'RETRIEVAL_QUERY') {
     taskType,
     outputDimensionality: EMBED_DIMS(),
   });
+  recordUsage('embed');
   return normalize(data.embedding.values);
 }
 
-/** Embed many strings in one round trip (max ~100 per request). */
-export async function embedBatch(texts, taskType = 'RETRIEVAL_DOCUMENT') {
+/**
+ * Embed many strings, batched (the API caps a request at ~100).
+ * onProgress({done, total}) fires after each batch so a long ingest can report
+ * live progress instead of sitting silent for thirty seconds.
+ */
+export async function embedBatch(texts, taskType = 'RETRIEVAL_DOCUMENT', onProgress) {
   const model = EMBED_MODEL();
   const out = [];
   for (let i = 0; i < texts.length; i += 90) {
     const slice = texts.slice(i, i + 90);
-    const data = await callGemini(`${model}:batchEmbedContents`, {
+    const body = {
       requests: slice.map((text) => ({
         model: `models/${model}`,
         content: { parts: [{ text }] },
         taskType,
         outputDimensionality: EMBED_DIMS(),
       })),
-    });
+    };
+
+    let data;
+    try {
+      data = await callGemini(`${model}:batchEmbedContents`, body);
+    } catch (err) {
+      // One retry: batch embedding fails often enough on transient 429/503 that
+      // losing a whole ingest to a single blip is not acceptable.
+      console.warn(`[gemini] embed batch at ${i} failed (${err.message}), retrying once`);
+      await new Promise((r) => setTimeout(r, 1500));
+      data = await callGemini(`${model}:batchEmbedContents`, body);
+    }
+
+    recordUsage('embed');
     out.push(...data.embeddings.map((e) => normalize(e.values)));
+    onProgress?.({ done: Math.min(i + 90, texts.length), total: texts.length });
   }
   return out;
 }
@@ -124,6 +145,11 @@ export async function generate({ system, history = [], message, temperature = 0.
     contents,
     systemInstruction: { parts: [{ text: system }] },
     generationConfig,
+  });
+
+  recordUsage('chat', {
+    prompt: data.usageMetadata?.promptTokenCount ?? 0,
+    output: data.usageMetadata?.candidatesTokenCount ?? 0,
   });
 
   const candidate = data.candidates?.[0];
