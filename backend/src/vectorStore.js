@@ -78,7 +78,7 @@ function fail(message, status) {
 
 export function swapIndex(collectionId) {
   const id = collectionId ?? activeCollectionId();
-  if (!id) throw new Error('No active collection. Upload a catalog in the admin console.');
+  if (!id) throw new Error('No catalog is currently loaded.');
 
   const manifest = readManifest(id);
   if (!manifest) throw fail(`Collection ${id} not found on disk`, 404);

@@ -170,21 +170,13 @@ export default function Home() {
   return (
     <div className="shell">
       <header className="masthead">
-        <h1>📚 Bookworm</h1>
-        <p>
-          {catalog.count ? (
-            <>
-              A retrieval-augmented book recommender. Every suggestion is grounded in a{' '}
-              {catalog.count}-book catalog — open “Retrieved catalog entries” under any answer to
-              see exactly what the model was given.
-            </>
-          ) : (
-            <>
-              A retrieval-augmented book recommender. No catalog is loaded yet — upload one in the{' '}
-              <a href="/admin">admin console</a> to get started.
-            </>
-          )}
-        </p>
+        <div className="brand">
+          <span className="brand-mark" aria-hidden="true">📚</span>
+          <div>
+            <h1>Bookworm</h1>
+            <p className="tagline">Retrieval-augmented book recommendations</p>
+          </div>
+        </div>
         <div className="pipeline">
           <span>Next.js</span>
           <span>→ Express</span>
@@ -196,6 +188,16 @@ export default function Home() {
           <span>→ cosine top-{health?.retrieveK ?? 6}</span>
           <span>→ {health?.chatModel ?? 'gemini'}</span>
         </div>
+        <p className="lede">
+          {catalog.count ? (
+            <>
+              Every suggestion is grounded in a {catalog.count}-book catalog — open “Retrieved
+              catalog entries” under any answer to see exactly what the model was given.
+            </>
+          ) : (
+            <>No catalog is available yet, so recommendations are paused for the moment.</>
+          )}
+        </p>
       </header>
 
       <div className="layout">
@@ -279,9 +281,7 @@ export default function Home() {
             </div>
             <div className="status">
               <span className={`dot ${catalog.count ? 'up' : 'down'}`} />
-              {catalog.count
-                ? `${catalog.count} books indexed`
-                : 'No catalog — upload one in the admin console'}
+              {catalog.count ? `${catalog.count} books indexed` : 'No catalog available yet'}
             </div>
             {catalog.collection && (
               <div className="status collection-name">
@@ -305,9 +305,6 @@ export default function Home() {
             <button className="reset" onClick={() => setMessages([GREETING])} disabled={busy}>
               Start a new conversation
             </button>
-            <a className="admin-link" href="/admin">
-              Admin console → upload a catalog
-            </a>
           </section>
         </aside>
       </div>

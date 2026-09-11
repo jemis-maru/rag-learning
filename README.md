@@ -47,7 +47,7 @@ cd backend && npm run ingest fixtures/books-50.csv
 ```
 
 Or do it through the UI at <http://localhost:3100/admin> (unlock with your
-`ADMIN_TOKEN`, upload `backend/fixtures/books-50.csv`, click Activate).
+`ADMIN_TOKEN`, upload `backend/fixtures/books-50.csv`, click Publish).
 
 Then open <http://localhost:3100> and ask for a book.
 

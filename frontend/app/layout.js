@@ -5,6 +5,12 @@ export const metadata = {
   description: 'A retrieval-augmented book recommender built with Next.js, Express and Gemini.',
 };
 
+export const viewport = {
+  themeColor: '#0b0d12',
+  width: 'device-width',
+  initialScale: 1,
+};
+
 export default function RootLayout({ children }) {
   return (
     <html lang="en">

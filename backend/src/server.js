@@ -52,9 +52,9 @@ app.get('/api/catalog', (req, res) => {
   });
 });
 
-const NO_CATALOG =
-  'No catalog is loaded yet. The store owner needs to upload their stock in ' +
-  'the admin console at /admin before recommendations can be made.';
+// Reader-facing, so it says what happened and nothing about how the catalog
+// gets there -- no console path, no operator instructions.
+const NO_CATALOG = 'No catalog is available yet, so recommendations are unavailable right now.';
 
 /** Retrieval only -- handy for checking the vector search without burning chat tokens. */
 app.post('/api/search', async (req, res, next) => {

@@ -24,6 +24,13 @@ const STRATEGIES = [
 
 const PAGE_SIZE = 25;
 
+/**
+ * Sign-in failures are reported without detail on purpose: the exact reason
+ * (bad token vs. auth not configured) is useful to an attacker and to nobody
+ * else. Real diagnostics stay in the server log.
+ */
+const SIGN_IN_ERROR = 'Could not sign in. Check your token and try again.';
+
 function fmtMs(ms) {
   if (ms == null) return '—';
   return ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}s`;
@@ -44,7 +51,7 @@ function doneText(job) {
   return (
     `Built ${s.books ?? 0} books` +
     (notes.length ? ` — ${notes.join(', ')}` : '') +
-    '. Activate it below to serve it to readers.'
+    '. Publish it below to serve it to readers.'
   );
 }
 
@@ -55,7 +62,6 @@ export default function Admin() {
 
   const [collections, setCollections] = useState([]);
   const [active, setActive] = useState(null);
-  const [stats, setStats] = useState(null);
 
   const [name, setName] = useState('');
   const [strategy, setStrategy] = useState('field-split');
@@ -95,10 +101,9 @@ export default function Admin() {
   const activeId = active?.id ?? null;
 
   const refresh = useCallback(async () => {
-    const [cols, s] = await Promise.all([api('collections'), api('stats')]);
+    const cols = await api('collections');
     setCollections(cols.collections);
     setActive(cols.active);
-    setStats(s);
   }, [api]);
 
   const loadStock = useCallback(
@@ -171,8 +176,8 @@ export default function Admin() {
 
   useEffect(() => {
     if (!token) return;
-    refresh().catch((err) => {
-      setAuthError(err.message);
+    refresh().catch(() => {
+      setAuthError(SIGN_IN_ERROR);
       setToken('');
       sessionStorage.removeItem('bookworm_admin_token');
     });
@@ -217,7 +222,6 @@ export default function Admin() {
     setToken('');
     setCollections([]);
     setActive(null);
-    setStats(null);
     setStock(null);
   }
 
@@ -276,31 +280,37 @@ export default function Admin() {
 
   if (!token) {
     return (
-      <div className="shell">
-        <header className="masthead">
-          <h1>🔐 Bookworm admin</h1>
-          <p>Enter the admin token from <code>backend/.env</code> to manage catalogs.</p>
-        </header>
-        <form className="card gate" onSubmit={signIn}>
-          <label htmlFor="tok">Admin token</label>
-          <input
-            id="tok"
-            type="password"
-            value={tokenInput}
-            onChange={(e) => setTokenInput(e.target.value)}
-            placeholder="ADMIN_TOKEN"
-            autoFocus
-          />
+      <div className="auth-wrap">
+        <form className="auth-card" onSubmit={signIn}>
+          <div className="auth-mark" aria-hidden="true">
+            🔒
+          </div>
+          <h1>Sign in</h1>
+          <p className="auth-sub">Bookworm catalog management</p>
+
+          <div className="field">
+            <label htmlFor="tok">Access token</label>
+            <input
+              id="tok"
+              type="password"
+              value={tokenInput}
+              onChange={(e) => setTokenInput(e.target.value)}
+              placeholder="••••••••••••"
+              autoComplete="current-password"
+              autoFocus
+            />
+          </div>
+
           <button type="submit" className="primary" disabled={!tokenInput.trim()}>
-            Unlock
+            Continue
           </button>
+
           {authError && <p className="msg err">{authError}</p>}
-          <p className="hint">
-            The token is held in this tab only and is attached to requests server-side — it never
-            reaches the browser bundle.
+
+          <p className="auth-foot">
+            <a href="/">← Back to Bookworm</a>
           </p>
         </form>
-        <p className="backlink"><a href="/">← Back to chat</a></p>
       </div>
     );
   }
@@ -308,379 +318,414 @@ export default function Admin() {
   // --------------------------------------------------------------- console
 
   return (
-    <div className="shell">
-      <header className="masthead admin-head">
-        <div>
-          <h1>📚 Bookworm admin</h1>
-          <p>
-            Upload your full stock and watch it move through the pipeline. Each upload is the whole
-            catalog — to add, correct or remove a book, edit your file and upload it again. Nothing
-            affects readers until you activate it.
-          </p>
+    <>
+      <header className="topbar">
+        <div className="brand">
+          <span className="brand-mark" aria-hidden="true">
+            📚
+          </span>
+          <div>
+            <h1>
+              Bookworm <span className="badge">Admin</span>
+            </h1>
+            <p className="tagline">Catalog management</p>
+          </div>
         </div>
-        <div className="head-actions">
-          <a href="/" className="ghost">Chat →</a>
-          <button className="ghost" onClick={signOut}>Sign out</button>
+        <div className="topbar-actions">
+          <a href="/" className="ghost">
+            <span className="long">View site →</span>
+            <span className="short">Site →</span>
+          </a>
+          <button className="ghost" onClick={signOut}>
+            Sign out
+          </button>
         </div>
       </header>
 
-      {active && (
-        <div className="active-bar">
-          <span className="dot up" />
-          Serving <strong>{active.name}</strong> — {active.books} books, {active.chunks} chunks,{' '}
-          <code>{active.chunkStrategy}</code>
-        </div>
-      )}
-
-      {notice && <div className={`msg ${notice.kind}`}>{notice.text}</div>}
-
-      <section className="card">
-        <h2>1 · Upload your stock</h2>
-        <p className="hint section-hint">
-          This file replaces the live catalog entirely. Repeated rows — same <code>id</code>, or the
-          same title and author — collapse into one book, and unchanged books keep the vectors they
-          already have, so a re-upload only pays to embed what actually changed.
-        </p>
-        <form onSubmit={upload}>
-          <div
-            className={`drop ${dragging ? 'over' : ''} ${file ? 'has-file' : ''}`}
-            onDragOver={(e) => {
-              e.preventDefault();
-              setDragging(true);
-            }}
-            onDragLeave={() => setDragging(false)}
-            onDrop={(e) => {
-              e.preventDefault();
-              setDragging(false);
-              pickFile(e.dataTransfer.files?.[0]);
-            }}
-          >
-            <input
-              id="file"
-              type="file"
-              accept=".csv,.json"
-              onChange={(e) => pickFile(e.target.files?.[0])}
-            />
-            <label htmlFor="file">
-              {file ? (
-                <>
-                  <strong>{file.name}</strong>
-                  <span>{(file.size / 1024).toFixed(1)} KB — click to replace</span>
-                </>
-              ) : (
-                <>
-                  <strong>Drop a .csv or .json catalog here</strong>
-                  <span>or click to browse</span>
-                </>
-              )}
-            </label>
-          </div>
-
-          <div className="grid-2">
-            <div className="field">
-              <label htmlFor="cname">Collection name</label>
-              <input
-                id="cname"
-                value={name}
-                onChange={(e) => setName(e.target.value)}
-                placeholder="Autumn 2026 catalog"
-              />
-            </div>
-            <div className="field">
-              <label>Chunking strategy</label>
-              <div className="strategies">
-                {STRATEGIES.map((s) => (
-                  <label key={s.id} className={`strategy ${strategy === s.id ? 'on' : ''}`}>
-                    <input
-                      type="radio"
-                      name="strategy"
-                      value={s.id}
-                      checked={strategy === s.id}
-                      onChange={() => setStrategy(s.id)}
-                    />
-                    <span className="s-label">{s.label}</span>
-                    <span className="s-blurb">{s.blurb}</span>
-                  </label>
-                ))}
-              </div>
-            </div>
-          </div>
-
-          <details className="schema">
-            <summary>Expected columns</summary>
-            <p>
-              Required: <code>title</code>, <code>author</code>, <code>description</code>. Optional:{' '}
-              <code>id</code>, <code>year</code>, <code>genres</code>, <code>readingLevel</code>,{' '}
-              <code>pages</code>, <code>themes</code>, <code>mood</code>, <code>similarTo</code>.
-            </p>
-            <p>
-              List columns take semicolons: <code>Fantasy;Adventure</code>. Headers are
-              case-insensitive and <code>reading level</code> / <code>reading_level</code> both
-              work. Rows missing a required field are reported, not fatal.
-            </p>
-          </details>
-
-          <button
-            type="submit"
-            className="primary"
-            disabled={!file || job?.status === 'running'}
-          >
-            {job?.status === 'running' ? 'Processing…' : 'Run the pipeline'}
-          </button>
-        </form>
-      </section>
-
-      <section className="card">
-        <h2>2 · Pipeline</h2>
-        <div className="stages">
-          {STAGES.map((s, i) => {
-            const st = job?.stages?.[s.key];
-            const status = st?.status ?? 'idle';
-            return (
-              <div key={s.key} className={`stage ${status}`}>
-                <div className="s-top">
-                  <span className="s-num">{i + 1}</span>
-                  <span className="s-name">{s.label}</span>
-                </div>
-                <div className="s-count">
-                  {status === 'running' && s.key === 'embed' && st.total
-                    ? `${st.count ?? 0} / ${st.total}`
-                    : st?.count != null
-                      ? st.count
-                      : '—'}
-                </div>
-                <div className="s-meta">
-                  {status === 'running' && <span className="pulse">working…</span>}
-                  {status === 'done' && <span>{fmtMs(st.ms)}</span>}
-                  {status === 'failed' && <span className="fail">{st.error}</span>}
-                  {status === 'idle' && <span>{s.hint}</span>}
-                </div>
-                {s.key === 'validate' && (st?.rejected > 0 || st?.duplicates > 0) && (
-                  <div className="s-warn">
-                    {[
-                      st.rejected > 0 && `${st.rejected} rejected`,
-                      st.duplicates > 0 && `${st.duplicates} duplicate`,
-                    ]
-                      .filter(Boolean)
-                      .join(' · ')}
-                  </div>
-                )}
-                {s.key === 'embed' && st?.status === 'done' && st.reused > 0 && (
-                  <div className="s-warn ok">
-                    {st.embedded} embedded · {st.reused} reused
-                  </div>
-                )}
-              </div>
-            );
-          })}
-        </div>
-        {!job && <p className="hint">Upload a file to watch each stage report its counts and timing.</p>}
-      </section>
-
-      <section className="card">
-        <h2>3 · Collections</h2>
-        <p className="hint section-hint">
-          Activating a catalog makes it live and deletes the ones it supersedes — only the serving
-          catalog is kept. Your uploaded file is the backup.
-        </p>
-        {collections.length === 0 ? (
-          <p className="hint">No collections yet.</p>
-        ) : (
-          <div className="table-wrap">
-            <table>
-              <thead>
-                <tr>
-                  <th>Name</th>
-                  <th>Books</th>
-                  <th>Chunks</th>
-                  <th>Rejected</th>
-                  <th>Dupes</th>
-                  <th>Strategy</th>
-                  <th>Built</th>
-                  <th />
-                </tr>
-              </thead>
-              <tbody>
-                {collections.map((c) => (
-                  <tr key={c.id} className={c.active ? 'is-active' : undefined}>
-                    <td>
-                      {c.name}
-                      {c.active && <span className="badge">active</span>}
-                      {c.status !== 'ready' && <span className="badge warn">{c.status}</span>}
-                    </td>
-                    <td>{c.counts?.books ?? 0}</td>
-                    <td>{c.counts?.chunks ?? 0}</td>
-                    <td>{c.counts?.rejected ?? 0}</td>
-                    <td>{c.counts?.duplicates ?? 0}</td>
-                    <td><code>{c.chunkStrategy}</code></td>
-                    <td className="dim">{fmtDate(c.createdAt)}</td>
-                    <td className="actions">
-                      <button onClick={() => openInspector(c.id)}>Inspect</button>
-                      {!c.active && c.status === 'ready' && (
-                        <button
-                          onClick={() =>
-                            act(
-                              () => api(`collections/${c.id}/activate`, { method: 'POST' }),
-                              `“${c.name}” is now live. Superseded catalogs were removed.`
-                            )
-                          }
-                        >
-                          Activate
-                        </button>
-                      )}
-                      {!c.active && (
-                        <button
-                          className="danger"
-                          onClick={() =>
-                            act(
-                              () => api(`collections/${c.id}`, { method: 'DELETE' }),
-                              `Deleted “${c.name}”.`
-                            )
-                          }
-                        >
-                          Delete
-                        </button>
-                      )}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )}
-      </section>
-
-      <section className="card">
-        <div className="stock-head">
-          <h2>4 · Current stock</h2>
-          <div className="head-actions">
-            <button className="ghost" onClick={() => download('csv')} disabled={!stock?.total}>
-              Download CSV
-            </button>
-            <button className="ghost" onClick={() => download('json')} disabled={!stock?.total}>
-              Download JSON
-            </button>
-          </div>
-        </div>
-
-        {!stock?.total ? (
-          <p className="hint">
-            Nothing on the shelf yet — upload a catalog above and activate it.
-          </p>
-        ) : (
-          <>
-            <p className="hint section-hint">
-              What readers are being recommended from right now. This view is read-only: your
-              uploaded file is the source of truth, so the way to change a book is to download the
-              catalog, edit it, and upload it back.
-            </p>
-
-            <input
-              className="stock-search"
-              value={query}
-              placeholder="Search title, author, genre, theme or level…"
-              onChange={(e) => {
-                setQuery(e.target.value);
-                setPage(0);
-              }}
-            />
-
-            <div className="table-wrap">
-              <table>
-                <thead>
-                  <tr>
-                    <th>Title</th>
-                    <th>Author</th>
-                    <th>Year</th>
-                    <th>Level</th>
-                    <th>Pages</th>
-                    <th>Genres</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {stock.books.map((b) => (
-                    <tr key={b.id}>
-                      <td>{b.title}</td>
-                      <td>{b.author}</td>
-                      <td className="dim">{b.year ?? '—'}</td>
-                      <td><code>{b.readingLevel}</code></td>
-                      <td className="dim">{b.pages ?? '—'}</td>
-                      <td className="dim">{(b.genres ?? []).join(', ') || '—'}</td>
-                    </tr>
-                  ))}
-                  {stock.books.length === 0 && (
-                    <tr>
-                      <td colSpan={6} className="dim">No book matches “{query}”.</td>
-                    </tr>
-                  )}
-                </tbody>
-              </table>
-            </div>
-
-            <div className="pager">
-              <button onClick={() => setPage((p) => Math.max(0, p - 1))} disabled={page === 0}>
-                ← Previous
-              </button>
-              <span className="dim">
-                {stock.matched === 0
-                  ? '0 books'
-                  : `${stock.offset + 1}–${Math.min(stock.offset + stock.limit, stock.matched)} of ${stock.matched}`}
-                {query && stock.matched !== stock.total ? ` (of ${stock.total} in stock)` : ''}
+      <main className="admin-main">
+        {active ? (
+          <div className="live-bar">
+            <span className="dot up" />
+            <span>
+              Live: <span className="live-name">{active.name}</span>
+            </span>
+            <span className="live-meta">
+              <span className="chip">
+                <b>{active.books}</b> books
               </span>
-              <button
-                onClick={() => setPage((p) => p + 1)}
-                disabled={stock.offset + stock.limit >= stock.matched}
-              >
-                Next →
-              </button>
-            </div>
-          </>
-        )}
-      </section>
-
-      {stats && (
-        <section className="card">
-          <h2>5 · Traffic</h2>
-          <div className="stat-strip">
-            <div><b>{stats.totalRequests}</b><span>requests</span></div>
-            <div><b>{stats.latencyMs.p50}ms</b><span>p50</span></div>
-            <div><b>{stats.latencyMs.p95}ms</b><span>p95</span></div>
-            <div><b>{stats.errors}</b><span>errors (last {stats.sampled})</span></div>
-            <div><b>{stats.gemini.chatCalls}</b><span>chat calls</span></div>
-            <div><b>{stats.gemini.embedCalls}</b><span>embed calls</span></div>
-            <div>
-              <b>{(stats.gemini.promptTokens + stats.gemini.outputTokens).toLocaleString()}</b>
-              <span>tokens</span>
-            </div>
+              <span className="chip">
+                <b>{active.chunks}</b> chunks
+              </span>
+              <span className="chip">
+                <code>{active.chunkStrategy}</code>
+              </span>
+            </span>
           </div>
-          {stats.byPath.length > 0 && (
-            <div className="table-wrap">
-              <table>
-                <thead>
-                  <tr><th>Route</th><th>Calls</th><th>Errors</th><th>Avg</th></tr>
-                </thead>
-                <tbody>
-                  {stats.byPath.slice(0, 8).map((r) => (
-                    <tr key={r.route}>
-                      <td><code>{r.route}</code></td>
-                      <td>{r.count}</td>
-                      <td>{r.errors}</td>
-                      <td>{fmtMs(r.avgMs)}</td>
-                    </tr>
+        ) : (
+          <div className="live-bar idle">
+            <span className="dot down" />
+            <span>Nothing is live yet — upload a catalog to get started.</span>
+          </div>
+        )}
+
+        {notice && <div className={`msg ${notice.kind}`}>{notice.text}</div>}
+
+        {/* ---------------------------------------------------------- upload */}
+        <section className="card">
+          <div className="section-title">
+            <span className="step">1</span>
+            <h2>Upload your stock</h2>
+          </div>
+          <p className="hint section-hint">
+            Each upload is the whole catalog and replaces the live one once published. Repeated rows
+            — same <code>id</code>, or the same title and author — collapse into one book, and
+            unchanged books keep the vectors they already have, so a re-upload only pays to embed
+            what actually changed.
+          </p>
+
+          <form onSubmit={upload}>
+            <div
+              className={`drop ${dragging ? 'over' : ''} ${file ? 'has-file' : ''}`}
+              onDragOver={(e) => {
+                e.preventDefault();
+                setDragging(true);
+              }}
+              onDragLeave={() => setDragging(false)}
+              onDrop={(e) => {
+                e.preventDefault();
+                setDragging(false);
+                pickFile(e.dataTransfer.files?.[0]);
+              }}
+            >
+              <input
+                id="file"
+                type="file"
+                accept=".csv,.json"
+                onChange={(e) => pickFile(e.target.files?.[0])}
+              />
+              <label htmlFor="file">
+                <span className="drop-icon" aria-hidden="true">
+                  {file ? '📄' : '⬆️'}
+                </span>
+                {file ? (
+                  <>
+                    <strong>{file.name}</strong>
+                    <span>{(file.size / 1024).toFixed(1)} KB — click to replace</span>
+                  </>
+                ) : (
+                  <>
+                    <strong>Drop a .csv or .json catalog here</strong>
+                    <span>or click to browse</span>
+                  </>
+                )}
+              </label>
+            </div>
+
+            <div className="grid-2">
+              <div className="field">
+                <label htmlFor="cname">Collection name</label>
+                <input
+                  id="cname"
+                  value={name}
+                  onChange={(e) => setName(e.target.value)}
+                  placeholder="Autumn 2026 catalog"
+                />
+              </div>
+              <div className="field">
+                <span className="field-label">Chunking strategy</span>
+                <div className="strategies">
+                  {STRATEGIES.map((s) => (
+                    <label key={s.id} className={`strategy ${strategy === s.id ? 'on' : ''}`}>
+                      <input
+                        type="radio"
+                        name="strategy"
+                        value={s.id}
+                        checked={strategy === s.id}
+                        onChange={() => setStrategy(s.id)}
+                      />
+                      <span className="s-label">{s.label}</span>
+                      <span className="s-blurb">{s.blurb}</span>
+                    </label>
                   ))}
-                </tbody>
-              </table>
+                </div>
+              </div>
+            </div>
+
+            <details className="schema">
+              <summary>Expected columns</summary>
+              <p>
+                Required: <code>title</code>, <code>author</code>, <code>description</code>.
+                Optional: <code>id</code>, <code>year</code>, <code>genres</code>,{' '}
+                <code>readingLevel</code>, <code>pages</code>, <code>themes</code>,{' '}
+                <code>mood</code>, <code>similarTo</code>.
+              </p>
+              <p>
+                List columns take semicolons: <code>Fantasy;Adventure</code>. Headers are
+                case-insensitive and <code>reading level</code> / <code>reading_level</code> both
+                work. Rows missing a required field are reported, not fatal.
+              </p>
+            </details>
+
+            <div className="form-foot">
+              <button type="submit" className="primary" disabled={!file || job?.status === 'running'}>
+                {job?.status === 'running' ? 'Processing…' : 'Run the pipeline'}
+              </button>
+              {file && job?.status !== 'running' && (
+                <span className="hint inline">
+                  Readers keep seeing the live catalog until you publish this one.
+                </span>
+              )}
+            </div>
+          </form>
+        </section>
+
+        {/* -------------------------------------------------------- pipeline */}
+        <section className="card">
+          <div className="section-title">
+            <span className="step">2</span>
+            <h2>Pipeline</h2>
+          </div>
+          <p className="hint section-hint">
+            Each stage reports its own counts and timing as the upload moves through.
+          </p>
+          <div className="stages">
+            {STAGES.map((s, i) => {
+              const st = job?.stages?.[s.key];
+              const status = st?.status ?? 'idle';
+              return (
+                <div key={s.key} className={`stage ${status}`}>
+                  <div className="s-top">
+                    <span className="s-num">{i + 1}</span>
+                    <span className="s-name">{s.label}</span>
+                  </div>
+                  <div className="s-count">
+                    {status === 'running' && s.key === 'embed' && st.total
+                      ? `${st.count ?? 0} / ${st.total}`
+                      : st?.count != null
+                        ? st.count
+                        : '—'}
+                  </div>
+                  <div className="s-meta">
+                    {status === 'running' && <span className="pulse">working…</span>}
+                    {status === 'done' && <span>{fmtMs(st.ms)}</span>}
+                    {status === 'failed' && <span className="fail">{st.error}</span>}
+                    {status === 'idle' && <span>{s.hint}</span>}
+                  </div>
+                  {s.key === 'validate' && (st?.rejected > 0 || st?.duplicates > 0) && (
+                    <div className="s-warn">
+                      {[
+                        st.rejected > 0 && `${st.rejected} rejected`,
+                        st.duplicates > 0 && `${st.duplicates} duplicate`,
+                      ]
+                        .filter(Boolean)
+                        .join(' · ')}
+                    </div>
+                  )}
+                  {s.key === 'embed' && st?.status === 'done' && st.reused > 0 && (
+                    <div className="s-warn ok">
+                      {st.embedded} embedded · {st.reused} reused
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </section>
+
+        {/* ------------------------------------------------------ collections */}
+        <section className="card">
+          <div className="section-title">
+            <span className="step">3</span>
+            <h2>Catalog</h2>
+          </div>
+          <p className="hint section-hint">
+            Only one catalog is kept. Publishing a new build makes it live and removes the one it
+            replaces — your uploaded file is the backup.
+          </p>
+
+          {collections.length === 0 ? (
+            <p className="empty">No catalog has been built yet.</p>
+          ) : (
+            <div className="versions">
+              {collections.map((c) => (
+                <article key={c.id} className={`version ${c.active ? 'is-live' : ''}`}>
+                  <div className="version-main">
+                    <div className="version-name">
+                      <span className="label">{c.name}</span>
+                      {c.active && <span className="badge live">Live</span>}
+                      {!c.active && c.status === 'ready' && <span className="badge">Ready</span>}
+                      {c.status !== 'ready' && <span className="badge warn">{c.status}</span>}
+                    </div>
+                    <div className="chips">
+                      <span className="chip">
+                        <b>{c.counts?.books ?? 0}</b> books
+                      </span>
+                      <span className="chip">
+                        <b>{c.counts?.chunks ?? 0}</b> chunks
+                      </span>
+                      <span className="chip">
+                        <code>{c.chunkStrategy}</code>
+                      </span>
+                      <span className="chip">{fmtDate(c.createdAt)}</span>
+                      {c.counts?.rejected > 0 && (
+                        <span className="chip warn">{c.counts.rejected} rejected</span>
+                      )}
+                      {c.counts?.duplicates > 0 && (
+                        <span className="chip warn">{c.counts.duplicates} duplicate</span>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="version-actions">
+                    <button className="tiny" onClick={() => openInspector(c.id)}>
+                      Inspect chunks
+                    </button>
+                    {!c.active && c.status === 'ready' && (
+                      <button
+                        className="tiny go"
+                        onClick={() =>
+                          act(
+                            () => api(`collections/${c.id}/activate`, { method: 'POST' }),
+                            `“${c.name}” is now live. The catalog it replaced was removed.`
+                          )
+                        }
+                      >
+                        Publish
+                      </button>
+                    )}
+                    {!c.active && (
+                      <button
+                        className="tiny danger"
+                        onClick={() =>
+                          act(
+                            () => api(`collections/${c.id}`, { method: 'DELETE' }),
+                            `Deleted “${c.name}”.`
+                          )
+                        }
+                      >
+                        Delete
+                      </button>
+                    )}
+                  </div>
+                </article>
+              ))}
             </div>
           )}
         </section>
-      )}
+
+        {/* ----------------------------------------------------------- stock */}
+        <section className="card">
+          <div className="card-head">
+            <div className="section-title">
+              <span className="step">4</span>
+              <h2>Current stock</h2>
+            </div>
+            <div className="head-actions">
+              <button className="ghost" onClick={() => download('csv')} disabled={!stock?.total}>
+                Download CSV
+              </button>
+              <button className="ghost" onClick={() => download('json')} disabled={!stock?.total}>
+                Download JSON
+              </button>
+            </div>
+          </div>
+
+          {!stock?.total ? (
+            <p className="empty">Nothing on the shelf yet — upload a catalog above and publish it.</p>
+          ) : (
+            <>
+              <p className="hint section-hint">
+                What readers are being recommended from right now. This view is read-only: your
+                uploaded file is the source of truth, so the way to change a book is to download the
+                catalog, edit it, and upload it back.
+              </p>
+
+              <div className="search-wrap">
+                <span className="icon" aria-hidden="true">
+                  🔍
+                </span>
+                <input
+                  className="input"
+                  value={query}
+                  placeholder="Search title, author, genre, theme or level…"
+                  onChange={(e) => {
+                    setQuery(e.target.value);
+                    setPage(0);
+                  }}
+                />
+              </div>
+
+              <div className="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Title</th>
+                      <th>Author</th>
+                      <th>Year</th>
+                      <th>Level</th>
+                      <th>Pages</th>
+                      <th>Genres</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {stock.books.map((b) => (
+                      <tr key={b.id}>
+                        <td className="title-cell">{b.title}</td>
+                        <td>{b.author}</td>
+                        <td className="dim">{b.year ?? '—'}</td>
+                        <td>
+                          <code>{b.readingLevel}</code>
+                        </td>
+                        <td className="dim">{b.pages ?? '—'}</td>
+                        <td className="dim">{(b.genres ?? []).join(', ') || '—'}</td>
+                      </tr>
+                    ))}
+                    {stock.books.length === 0 && (
+                      <tr>
+                        <td colSpan={6} className="dim">
+                          No book matches “{query}”.
+                        </td>
+                      </tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+
+              <div className="pager">
+                <button
+                  className="tiny"
+                  onClick={() => setPage((p) => Math.max(0, p - 1))}
+                  disabled={page === 0}
+                >
+                  ← Previous
+                </button>
+                <span className="count">
+                  {stock.matched === 0
+                    ? '0 books'
+                    : `${stock.offset + 1}–${Math.min(stock.offset + stock.limit, stock.matched)} of ${stock.matched}`}
+                  {query && stock.matched !== stock.total ? ` (of ${stock.total} in stock)` : ''}
+                </span>
+                <button
+                  className="tiny"
+                  onClick={() => setPage((p) => p + 1)}
+                  disabled={stock.offset + stock.limit >= stock.matched}
+                >
+                  Next →
+                </button>
+              </div>
+            </>
+          )}
+        </section>
+      </main>
 
       {inspect && (
         <div className="drawer-backdrop" onClick={() => setInspect(null)}>
           <aside className="drawer" onClick={(e) => e.stopPropagation()}>
             <div className="drawer-head">
               <h2>Chunks</h2>
-              <button className="ghost" onClick={() => setInspect(null)}>Close</button>
+              <button className="ghost" onClick={() => setInspect(null)}>
+                Close
+              </button>
             </div>
             <p className="hint">
               {inspect.total} chunks from {inspect.counts?.books ?? 0} books using{' '}
@@ -692,7 +737,9 @@ export default function Admin() {
                 <summary>{inspect.duplicates.length} duplicate row(s) collapsed</summary>
                 <ul>
                   {inspect.duplicates.slice(0, 30).map((d) => (
-                    <li key={d.row}>Row {d.row}: {d.reason}</li>
+                    <li key={d.row}>
+                      Row {d.row}: {d.reason}
+                    </li>
                   ))}
                 </ul>
               </details>
@@ -703,7 +750,9 @@ export default function Admin() {
                 <summary>{inspect.rejected.length} rejected row(s)</summary>
                 <ul>
                   {inspect.rejected.slice(0, 30).map((r) => (
-                    <li key={r.row}>Row {r.row}: {r.reason}</li>
+                    <li key={r.row}>
+                      Row {r.row}: {r.reason}
+                    </li>
                   ))}
                 </ul>
               </details>
@@ -724,6 +773,6 @@ export default function Admin() {
           </aside>
         </div>
       )}
-    </div>
+    </>
   );
 }
