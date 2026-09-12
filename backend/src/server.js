@@ -13,6 +13,7 @@ import {
   swapIndex,
 } from './vectorStore.js';
 import { adminRouter } from './adminRoutes.js';
+import { initDb } from './db.js';
 import { observe, requireAdmin } from './middleware.js';
 import { READING_LEVELS } from './pipeline/parse.js';
 
@@ -123,7 +124,7 @@ app.use((err, req, res, next) => {
 });
 
 /**
- * Boot: load whichever collection is active, if there is one.
+ * Boot: create the schema if needed, then load whichever collection is active.
  *
  * Startup never embeds anything. A fresh install comes up with an empty index
  * and stays that way until an admin uploads a catalog -- the chat side reports
@@ -131,8 +132,10 @@ app.use((err, req, res, next) => {
  * process refusing to start or quietly spending money on a demo dataset.
  */
 async function boot() {
+  await initDb();
+
   try {
-    swapIndex();
+    await swapIndex();
   } catch (err) {
     console.warn(`[server] no catalog loaded: ${err.message}`);
   }

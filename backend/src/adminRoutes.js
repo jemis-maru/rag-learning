@@ -5,6 +5,7 @@
 
 import express from 'express';
 import {
+  countChunks,
   deleteCollection,
   getCollection,
   listCollections,
@@ -12,6 +13,7 @@ import {
   readBooks,
   readChunks,
   readManifest,
+  searchBooks,
   setActive,
 } from './collections.js';
 import { getJob, startIngest } from './pipeline/run.js';
@@ -30,7 +32,7 @@ export const adminRouter = express.Router();
 adminRouter.post(
   '/upload',
   express.raw({ type: '*/*', limit: '10mb' }),
-  (req, res) => {
+  async (req, res, next) => {
     const { name, format, strategy = DEFAULT_STRATEGY } = req.query;
 
     if (format !== 'csv' && format !== 'json') {
@@ -43,14 +45,17 @@ adminRouter.post(
       return res.status(400).json({ error: 'request body is empty -- send the file contents raw' });
     }
 
-    const job = startIngest({
-      name: typeof name === 'string' && name.trim() ? name.trim().slice(0, 80) : null,
-      format,
-      chunkStrategy: strategy,
-      buffer: req.body,
-    });
-
-    res.status(202).json({ jobId: job.jobId, collectionId: job.collectionId });
+    try {
+      const job = await startIngest({
+        name: typeof name === 'string' && name.trim() ? name.trim().slice(0, 80) : null,
+        format,
+        chunkStrategy: strategy,
+        buffer: req.body,
+      });
+      res.status(202).json({ jobId: job.jobId, collectionId: job.collectionId });
+    } catch (err) {
+      next(err);
+    }
   }
 );
 
@@ -60,8 +65,12 @@ adminRouter.get('/jobs/:id', (req, res) => {
   res.json(job);
 });
 
-adminRouter.get('/collections', (req, res) => {
-  res.json({ active: activeInfo(), collections: listCollections() });
+adminRouter.get('/collections', async (req, res, next) => {
+  try {
+    res.json({ active: activeInfo(), collections: await listCollections() });
+  } catch (err) {
+    next(err);
+  }
 });
 
 /**
@@ -71,14 +80,14 @@ adminRouter.get('/collections', (req, res) => {
  * out to be unloadable throws while the previous catalog is still on disk and
  * still serving, instead of leaving the store with nothing.
  */
-adminRouter.post('/collections/:id/activate', (req, res, next) => {
+adminRouter.post('/collections/:id/activate', async (req, res, next) => {
   try {
     const { id } = req.params;
-    if (!getCollection(id)) return res.status(404).json({ error: 'Unknown collection' });
+    if (!(await getCollection(id))) return res.status(404).json({ error: 'Unknown collection' });
 
-    const info = swapIndex(id); // hot swap, no restart -- and it validates the files
-    setActive(id);
-    const removed = pruneExcept(id);
+    const info = await swapIndex(id); // hot swap, no restart -- and it validates the rows
+    await setActive(id);
+    const removed = await pruneExcept(id);
     if (removed.length) console.log(`[admin] pruned ${removed.length} superseded collection(s)`);
 
     res.json({ ok: true, active: info, pruned: removed.length });
@@ -87,10 +96,12 @@ adminRouter.post('/collections/:id/activate', (req, res, next) => {
   }
 });
 
-adminRouter.delete('/collections/:id', (req, res, next) => {
+adminRouter.delete('/collections/:id', async (req, res, next) => {
   try {
-    if (!getCollection(req.params.id)) return res.status(404).json({ error: 'Unknown collection' });
-    deleteCollection(req.params.id);
+    if (!(await getCollection(req.params.id))) {
+      return res.status(404).json({ error: 'Unknown collection' });
+    }
+    await deleteCollection(req.params.id);
     res.json({ ok: true });
   } catch (err) {
     if (err.status === 409) return res.status(409).json({ error: err.message });
@@ -99,24 +110,32 @@ adminRouter.delete('/collections/:id', (req, res, next) => {
 });
 
 /** Chunk inspector -- "show me exactly what chunking produced". */
-adminRouter.get('/collections/:id/chunks', (req, res) => {
-  const manifest = readManifest(req.params.id);
-  if (!manifest) return res.status(404).json({ error: 'Unknown collection' });
+adminRouter.get('/collections/:id/chunks', async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const manifest = await readManifest(id);
+    if (!manifest) return res.status(404).json({ error: 'Unknown collection' });
 
-  const offset = Math.max(0, Number(req.query.offset) || 0);
-  const limit = Math.min(Math.max(1, Number(req.query.limit) || 20), 100);
-  const all = readChunks(req.params.id);
+    const offset = Math.max(0, Number(req.query.offset) || 0);
+    const limit = Math.min(Math.max(1, Number(req.query.limit) || 20), 100);
+    const [total, chunks] = await Promise.all([
+      countChunks(id),
+      readChunks(id, { offset, limit }),
+    ]);
 
-  res.json({
-    total: all.length,
-    offset,
-    limit,
-    rejected: manifest.rejected ?? [],
-    duplicates: manifest.duplicates ?? [],
-    counts: manifest.counts,
-    chunkStrategy: manifest.chunkStrategy,
-    chunks: all.slice(offset, offset + limit),
-  });
+    res.json({
+      total,
+      offset,
+      limit,
+      rejected: manifest.rejected ?? [],
+      duplicates: manifest.duplicates ?? [],
+      counts: manifest.counts,
+      chunkStrategy: manifest.chunkStrategy,
+      chunks,
+    });
+  } catch (err) {
+    next(err);
+  }
 });
 
 // ------------------------------------------------------------------- stock
@@ -144,58 +163,49 @@ function toCsv(books) {
  * file is the source of truth, so editing a row here would immediately be a
  * second version of the truth. Corrections go through a re-upload.
  */
-adminRouter.get('/books', (req, res) => {
-  const id = activeInfo()?.id;
-  const limit = Math.min(Math.max(1, Number(req.query.limit) || 25), 200);
-  if (!id) {
-    return res.json({ collectionId: null, total: 0, matched: 0, offset: 0, limit, books: [] });
+adminRouter.get('/books', async (req, res, next) => {
+  try {
+    const id = activeInfo()?.id;
+    const limit = Math.min(Math.max(1, Number(req.query.limit) || 25), 200);
+    if (!id) {
+      return res.json({ collectionId: null, total: 0, matched: 0, offset: 0, limit, books: [] });
+    }
+
+    const offset = Math.max(0, Number(req.query.offset) || 0);
+    const q = String(req.query.q ?? '');
+    const { total, matched, books } = await searchBooks(id, { q, offset, limit });
+
+    res.json({ collectionId: id, total, matched, offset, limit, books });
+  } catch (err) {
+    next(err);
   }
-
-  const all = readBooks(id);
-  const q = String(req.query.q ?? '').trim().toLowerCase();
-  const matched = q
-    ? all.filter((b) =>
-        [b.title, b.author, b.readingLevel, ...(b.genres ?? []), ...(b.themes ?? [])]
-          .join(' ')
-          .toLowerCase()
-          .includes(q)
-      )
-    : all;
-
-  const offset = Math.max(0, Number(req.query.offset) || 0);
-
-  res.json({
-    collectionId: id,
-    total: all.length,
-    matched: matched.length,
-    offset,
-    limit,
-    books: matched.slice(offset, offset + limit),
-  });
 });
 
 /**
  * Download the live stock as the same shape the uploader accepts, so the
  * round trip is: download, edit in a spreadsheet, upload the whole thing back.
  */
-adminRouter.get('/books/export', (req, res) => {
-  const id = activeInfo()?.id;
-  if (!id) return res.status(404).json({ error: 'No catalog is loaded yet' });
+adminRouter.get('/books/export', async (req, res, next) => {
+  try {
+    const id = activeInfo()?.id;
+    if (!id) return res.status(404).json({ error: 'No catalog is loaded yet' });
 
-  const books = readBooks(id);
-  const manifest = readManifest(id);
-  const stamp = new Date().toISOString().slice(0, 10);
-  const base = `${(manifest?.name || 'catalog').replace(/[^a-z0-9._-]+/gi, '-')}-${stamp}`;
+    const [books, manifest] = await Promise.all([readBooks(id), readManifest(id)]);
+    const stamp = new Date().toISOString().slice(0, 10);
+    const base = `${(manifest?.name || 'catalog').replace(/[^a-z0-9._-]+/gi, '-')}-${stamp}`;
 
-  if (req.query.format === 'json') {
-    res.setHeader('content-type', 'application/json; charset=utf-8');
-    res.setHeader('content-disposition', `attachment; filename="${base}.json"`);
-    return res.send(JSON.stringify({ books }, null, 2));
+    if (req.query.format === 'json') {
+      res.setHeader('content-type', 'application/json; charset=utf-8');
+      res.setHeader('content-disposition', `attachment; filename="${base}.json"`);
+      return res.send(JSON.stringify({ books }, null, 2));
+    }
+
+    res.setHeader('content-type', 'text/csv; charset=utf-8');
+    res.setHeader('content-disposition', `attachment; filename="${base}.csv"`);
+    res.send(toCsv(books));
+  } catch (err) {
+    next(err);
   }
-
-  res.setHeader('content-type', 'text/csv; charset=utf-8');
-  res.setHeader('content-disposition', `attachment; filename="${base}.csv"`);
-  res.send(toCsv(books));
 });
 
 adminRouter.get('/stats', (req, res) => {

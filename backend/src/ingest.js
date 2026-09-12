@@ -10,6 +10,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { getJob, startIngest } from './pipeline/run.js';
 import { pruneExcept, setActive } from './collections.js';
+import { closeDb, initDb } from './db.js';
 import { DEFAULT_STRATEGY, STRATEGIES } from './pipeline/chunk.js';
 
 const [file, strategy = DEFAULT_STRATEGY] = process.argv.slice(2);
@@ -29,7 +30,9 @@ async function main() {
     throw new Error(`strategy must be one of: ${STRATEGIES.join(', ')}`);
   }
 
-  const job = startIngest({
+  await initDb();
+
+  const job = await startIngest({
     name: path.basename(file),
     format,
     chunkStrategy: strategy,
@@ -44,8 +47,8 @@ async function main() {
   const done = getJob(job.jobId);
   if (done.status === 'failed') throw new Error(done.error);
 
-  setActive(done.collectionId);
-  const pruned = pruneExcept(done.collectionId);
+  await setActive(done.collectionId);
+  const pruned = await pruneExcept(done.collectionId);
 
   const stages = Object.entries(done.stages)
     .map(([name, s]) => `${name} ${s.count ?? 0} (${s.ms}ms)`)
@@ -62,7 +65,9 @@ async function main() {
   );
 }
 
-main().catch((err) => {
-  console.error('Ingest failed:', err.message);
-  process.exit(1);
-});
+main()
+  .then(() => closeDb())
+  .catch((err) => {
+    console.error('Ingest failed:', err.message);
+    process.exit(1);
+  });

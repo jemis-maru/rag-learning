@@ -11,19 +11,19 @@
  * edit the spreadsheet, upload it again. There is no partial-update path to get
  * out of sync with.
  *
- * A run only ever writes into its own new collection directory, so a failed or
- * half-finished upload can never damage the catalog the chat side is serving.
+ * A run only ever writes rows belonging to its own new collection, so a failed
+ * or half-finished upload can never damage the catalog the chat side is serving.
  * The previous collection is not discarded until the new one is activated.
  */
 
-import crypto from 'node:crypto';
 import { embedBatch } from '../gemini.js';
 import { parseCatalog } from './parse.js';
 import { chunkBooks, DEFAULT_STRATEGY } from './chunk.js';
 import {
   activeCollectionId,
+  copyReusableEmbeddings,
   createCollection,
-  readEmbeddings,
+  readUnembeddedChunks,
   saveChunks,
   saveEmbeddings,
   saveRaw,
@@ -34,11 +34,6 @@ const STAGES = ['parse', 'validate', 'chunk', 'embed'];
 
 const embedModel = () => process.env.EMBED_MODEL || 'gemini-embedding-001';
 const embedDims = () => Number(process.env.EMBED_DIMS) || 768;
-
-/** Short digest of a chunk's text -- the "is this vector still valid" check. */
-function textHash(text) {
-  return crypto.createHash('sha1').update(text).digest('hex').slice(0, 16);
-}
 
 // ------------------------------------------------------------------ jobs
 
@@ -92,54 +87,41 @@ async function stage(job, name, fn) {
 // ------------------------------------------------------------- embedding
 
 /**
- * Produce a vector for every chunk, reusing any whose text is byte-identical to
- * one the currently-live collection already embedded with the same model.
+ * Give every chunk of `collectionId` a vector.
  *
- * This is what keeps re-uploading the full catalog cheap. A store that adds ten
- * titles to a five-thousand-book spreadsheet and uploads the whole thing again
- * pays to embed twenty chunks, not ten thousand -- the other rows hash the same
- * and their vectors carry straight over.
+ * The reuse half is a single UPDATE: Postgres copies across any vector whose
+ * chunk id and text hash still match the collection we are building on top of,
+ * so unchanged rows never leave the database, let alone go to Gemini. Only what
+ * is left without a vector afterwards is actually embedded.
  *
- * Hashing the text is the load-bearing part: a chunk id is derived from the
- * book id, so an edited description keeps its chunk id while very much needing
- * a fresh vector. Comparing ids alone would silently serve a stale embedding.
- *
- * @param {{chunkId:string,text:string}[]} chunks
- * @param {object|null} prior  a previous embeddings.json ({model,dims,hashes,vectors})
+ * See copyReusableEmbeddings() for why the hash, not the chunk id, is the thing
+ * that decides reusability.
  */
-async function resolveVectors(chunks, prior, onProgress) {
+async function resolveVectors(collectionId, baseId, total, onProgress) {
   const model = embedModel();
   const dims = embedDims();
-  const canReuse = prior?.model === model && prior?.dims === dims && prior?.vectors;
 
-  const vectors = {};
-  const hashes = {};
-  const todo = [];
+  const reused = await copyReusableEmbeddings(collectionId, baseId, { model, dims });
+  onProgress?.({ done: reused, total, reused });
 
-  for (const chunk of chunks) {
-    const hash = textHash(chunk.text);
-    hashes[chunk.chunkId] = hash;
-    const cached =
-      canReuse && prior.hashes?.[chunk.chunkId] === hash ? prior.vectors[chunk.chunkId] : null;
-    if (cached) vectors[chunk.chunkId] = cached;
-    else todo.push(chunk);
-  }
+  const todo = await readUnembeddedChunks(collectionId);
 
-  const reused = chunks.length - todo.length;
-  onProgress?.({ done: reused, total: chunks.length, reused });
-
+  let vectors = [];
   if (todo.length) {
     const fresh = await embedBatch(
       todo.map((c) => c.text),
       'RETRIEVAL_DOCUMENT',
-      ({ done }) => onProgress?.({ done: reused + done, total: chunks.length, reused })
+      ({ done }) => onProgress?.({ done: reused + done, total, reused })
     );
-    todo.forEach((c, i) => {
-      vectors[c.chunkId] = fresh[i];
-    });
+    vectors = todo.map((c, i) => ({ chunkId: c.chunkId, vector: fresh[i] }));
   }
 
-  return { vectors, hashes, embedded: todo.length, reused };
+  // Called even with nothing fresh to write: it also stamps the model and
+  // dimensionality the collection was built at, which is what a later upload
+  // checks before reusing any of these vectors.
+  await saveEmbeddings(collectionId, vectors, { model, dims });
+
+  return { model, dims, embedded: todo.length, reused };
 }
 
 // -------------------------------------------------------------- the pipeline
@@ -148,14 +130,14 @@ async function resolveVectors(chunks, prior, onProgress) {
  * Kick off an ingest. Returns immediately with the job -- the work continues in
  * the background so the upload request does not sit open for the whole embed.
  */
-export function startIngest({ name, format, chunkStrategy = DEFAULT_STRATEGY, buffer }) {
+export async function startIngest({ name, format, chunkStrategy = DEFAULT_STRATEGY, buffer }) {
   sweepJobs();
 
   // The live collection is the vector cache for this build. It stays untouched
   // and readable until the admin activates the replacement.
-  const baseId = activeCollectionId();
+  const baseId = await activeCollectionId();
 
-  const collectionId = createCollection({ name, format, chunkStrategy });
+  const collectionId = await createCollection({ name, format, chunkStrategy });
   const job = newJob(collectionId);
 
   runIngest({ job, collectionId, format, chunkStrategy, baseId, buffer }).catch((err) => {
@@ -165,18 +147,16 @@ export function startIngest({ name, format, chunkStrategy = DEFAULT_STRATEGY, bu
     // Recording the failure must not itself throw: this runs in a detached
     // promise, so an exception here would surface as an unhandled rejection and
     // take the whole server down instead of failing one upload.
-    try {
-      updateManifest(collectionId, { status: 'failed', error: err.message });
-    } catch (writeErr) {
+    updateManifest(collectionId, { status: 'failed', error: err.message }).catch((writeErr) => {
       console.error(`[ingest] could not mark ${collectionId} failed: ${writeErr.message}`);
-    }
+    });
   });
 
   return job;
 }
 
 async function runIngest({ job, collectionId, format, chunkStrategy, baseId, buffer }) {
-  saveRaw(collectionId, `raw.${format}`, buffer);
+  await saveRaw(collectionId, `raw.${format}`, buffer);
 
   const parsed = await stage(job, 'parse', (entry) => {
     const result = parseCatalog(buffer.toString('utf8'), format);
@@ -210,8 +190,8 @@ async function runIngest({ job, collectionId, format, chunkStrategy, baseId, buf
     duplicates: parsed.duplicates.length,
   };
 
-  // Books live in the manifest; chunks carry the text retrieval scores against.
-  updateManifest(collectionId, {
+  // Books are their own rows; chunks carry the text retrieval scores against.
+  await updateManifest(collectionId, {
     books: parsed.books,
     // Cap both: a broken file could reject or duplicate thousands of rows, and
     // the manifest is read on every admin page load.
@@ -226,29 +206,25 @@ async function runIngest({ job, collectionId, format, chunkStrategy, baseId, buf
       chunks: chunks.length,
     },
   });
-  saveChunks(collectionId, chunks);
+  await saveChunks(collectionId, chunks);
 
-  const model = embedModel();
-  const dims = embedDims();
-  const prior = baseId ? readEmbeddings(baseId) : null;
-
-  await stage(job, 'embed', async (entry) => {
+  const { model, dims } = await stage(job, 'embed', async (entry) => {
     entry.count = 0;
     entry.total = chunks.length;
-    const { vectors, hashes, embedded, reused } = await resolveVectors(chunks, prior, (p) => {
+    const result = await resolveVectors(collectionId, baseId, chunks.length, (p) => {
       entry.count = p.done;
       entry.reused = p.reused;
     });
-    saveEmbeddings(collectionId, { model, dims, vectors, hashes });
     entry.count = chunks.length;
-    entry.embedded = embedded;
-    entry.reused = reused;
-    summary.embedded = embedded;
-    summary.reusedVectors = reused;
+    entry.embedded = result.embedded;
+    entry.reused = result.reused;
+    summary.embedded = result.embedded;
+    summary.reusedVectors = result.reused;
+    return result;
   });
 
   const timings = Object.fromEntries(STAGES.map((s) => [s, job.stages[s].ms]));
-  updateManifest(collectionId, { status: 'ready', model, dims, timings, summary });
+  await updateManifest(collectionId, { status: 'ready', model, dims, timings, summary });
 
   job.summary = summary;
   job.status = 'done';

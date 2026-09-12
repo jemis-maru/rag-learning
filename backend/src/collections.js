@@ -1,49 +1,24 @@
 /**
- * Versioned catalog collections on disk.
+ * Versioned catalog collections, stored in Postgres.
  *
  * Every upload -- a full replace or an incremental append -- becomes its own
- * directory under data/collections/, so a bad upload cannot damage the catalog
- * the chat side is currently serving and rolling back is a one-line flip of
- * activeCollectionId in index.json.
+ * row in `collections` plus its own `books` and `chunks` rows, so a bad upload
+ * cannot damage the catalog the chat side is currently serving and rolling back
+ * is a one-line flip of app_state.active_collection_id.
  *
  * Only one collection is ever kept. Activating a new one prunes the rest:
  * nothing but the live collection is read at runtime, and each superseded
- * catalog would otherwise leave its whole vector set on disk forever. The
+ * catalog would otherwise leave its whole vector set in the table forever. The
  * uploaded file is the source of truth, so a rollback is a re-upload.
  */
 
-import fs from 'node:fs';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
-
-const DIR = path.dirname(fileURLToPath(import.meta.url));
-const DATA_DIR = path.join(DIR, 'data');
-const COLLECTIONS_DIR = path.join(DATA_DIR, 'collections');
-const INDEX_PATH = path.join(DATA_DIR, 'index.json');
-
-/**
- * Write JSON via a temp file + rename. rename() is atomic within a filesystem,
- * so a crash mid-write leaves the previous file intact rather than a half-written
- * one that fails to parse on the next boot.
- */
-export function writeJsonAtomic(filePath, value) {
-  const tmp = `${filePath}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(value));
-  fs.renameSync(tmp, filePath);
-}
-
-function readJson(filePath, fallback = null) {
-  try {
-    return JSON.parse(fs.readFileSync(filePath, 'utf8'));
-  } catch {
-    return fallback;
-  }
-}
+import crypto from 'node:crypto';
+import { query, toVectorLiteral, withTransaction } from './db.js';
 
 /**
  * Collection ids are generated here, never supplied by a caller -- but they do
- * arrive back as URL path segments and query params. Validating the shape means
- * a crafted id like `../../etc` cannot walk out of the collections directory.
+ * arrive back as URL path segments and query params. Validating the shape keeps
+ * a crafted id out of the queries and gives the routes a cheap 404 path.
  */
 const ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
 
@@ -51,29 +26,12 @@ export function isValidId(id) {
   return typeof id === 'string' && ID_PATTERN.test(id);
 }
 
-export function collectionDir(id) {
-  if (!isValidId(id)) throw new Error(`Invalid collection id: ${id}`);
-  return path.join(COLLECTIONS_DIR, id);
+/** Short digest of a chunk's text -- the "is this vector still valid" check. */
+export function textHash(text) {
+  return crypto.createHash('sha1').update(text).digest('hex').slice(0, 16);
 }
 
-// The readers answer "not found" for a malformed id rather than throwing, so a
-// bad id from a URL is a 404 to the caller instead of a 500.
-export function readManifest(id) {
-  if (!isValidId(id)) return null;
-  return readJson(path.join(collectionDir(id), 'manifest.json'));
-}
-
-export function readChunks(id) {
-  if (!isValidId(id)) return [];
-  return readJson(path.join(collectionDir(id), 'chunks.json'), []);
-}
-
-export function readEmbeddings(id) {
-  if (!isValidId(id)) return null;
-  return readJson(path.join(collectionDir(id), 'embeddings.json'));
-}
-
-/** A short, sortable, human-readable id: col_20260908_143012_a3f1 */
+/** A short, sortable, human-readable id: col_20260908143012_a3f1 */
 function newCollectionId() {
   const stamp = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14);
   const salt = Math.random().toString(16).slice(2, 6);
@@ -82,120 +40,386 @@ function newCollectionId() {
 
 // ---------------------------------------------------------------- registry
 
-function readIndex() {
-  return readJson(INDEX_PATH, { activeCollectionId: null, collections: [] });
-}
+/**
+ * The summary row the admin table renders -- cheap, no books, chunks or
+ * vectors touched.
+ */
+const SUMMARY_COLUMNS = `
+  id, name, format, chunk_strategy, status, created_at, counts, timings, model, dims
+`;
 
-function writeIndex(index) {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-  writeJsonAtomic(INDEX_PATH, index);
-}
-
-/** Summary rows for the admin table -- cheap, no chunk or vector files touched. */
-export function listCollections() {
-  const index = readIndex();
-  return index.collections.map((c) => ({ ...c, active: c.id === index.activeCollectionId }));
-}
-
-export function activeCollectionId() {
-  return readIndex().activeCollectionId;
-}
-
-export function getCollection(id) {
-  return listCollections().find((c) => c.id === id) ?? null;
-}
-
-/** Create the directory and a `building` manifest. Returns the id. */
-export function createCollection({ name, format, chunkStrategy }) {
-  const id = newCollectionId();
-  fs.mkdirSync(collectionDir(id), { recursive: true });
-
-  const manifest = {
-    id,
-    name: name || id,
-    format,
-    chunkStrategy,
-    status: 'building',
-    createdAt: new Date().toISOString(),
-    counts: { rows: 0, books: 0, rejected: 0, chunks: 0 },
-    timings: {},
-    rejected: [],
-  };
-  writeJsonAtomic(path.join(collectionDir(id), 'manifest.json'), manifest);
-
-  const index = readIndex();
-  index.collections.unshift(summarize(manifest));
-  writeIndex(index);
-  return id;
-}
-
-function summarize(m) {
+function toSummary(row) {
   return {
-    id: m.id,
-    name: m.name,
-    format: m.format,
-    chunkStrategy: m.chunkStrategy,
-    status: m.status,
-    createdAt: m.createdAt,
-    counts: m.counts,
-    timings: m.timings,
-    model: m.model,
-    dims: m.dims,
+    id: row.id,
+    name: row.name,
+    format: row.format,
+    chunkStrategy: row.chunk_strategy,
+    status: row.status,
+    createdAt: row.created_at.toISOString(),
+    counts: row.counts,
+    timings: row.timings,
+    model: row.model ?? undefined,
+    dims: row.dims ?? undefined,
   };
 }
 
-/** Merge fields into a manifest and mirror the summary into index.json. */
-export function updateManifest(id, patch) {
-  const current = readManifest(id);
-  if (!current) throw new Error(`Unknown collection: ${id}`);
-  const next = { ...current, ...patch };
-  writeJsonAtomic(path.join(collectionDir(id), 'manifest.json'), next);
-
-  const index = readIndex();
-  const i = index.collections.findIndex((c) => c.id === id);
-  if (i !== -1) index.collections[i] = summarize(next);
-  writeIndex(index);
-  return next;
+export async function listCollections() {
+  const { rows } = await query(
+    `SELECT ${SUMMARY_COLUMNS},
+            id = (SELECT active_collection_id FROM app_state) AS active
+       FROM collections
+      ORDER BY created_at DESC, id DESC`
+  );
+  return rows.map((r) => ({ ...toSummary(r), active: r.active }));
 }
 
-export function saveRaw(id, filename, buffer) {
-  fs.writeFileSync(path.join(collectionDir(id), filename), buffer);
+export async function activeCollectionId() {
+  const { rows } = await query('SELECT active_collection_id FROM app_state');
+  return rows[0]?.active_collection_id ?? null;
 }
 
-export function saveChunks(id, chunks) {
-  writeJsonAtomic(path.join(collectionDir(id), 'chunks.json'), chunks);
+export async function getCollection(id) {
+  if (!isValidId(id)) return null;
+  const { rows } = await query(
+    `SELECT ${SUMMARY_COLUMNS},
+            id = (SELECT active_collection_id FROM app_state) AS active
+       FROM collections WHERE id = $1`,
+    [id]
+  );
+  if (!rows.length) return null;
+  return { ...toSummary(rows[0]), active: rows[0].active };
 }
 
 /**
- * `hashes` maps chunkId -> a digest of the text that produced the vector.
- * Without it an incremental upload could not tell a reusable vector from a
- * stale one: chunk ids are derived from the book id, so an edited description
- * keeps its chunk id while needing a fresh embedding.
+ * The metadata for one collection -- its status, counts, timings and the rows
+ * it rejected. The books are their own table, read with readBooks().
+ *
+ * Answers null for a malformed id rather than throwing, so a bad id from a URL
+ * is a 404 to the caller instead of a 500.
  */
-export function saveEmbeddings(id, { model, dims, vectors, hashes = {} }) {
-  writeJsonAtomic(path.join(collectionDir(id), 'embeddings.json'), {
-    model,
-    dims,
-    builtAt: new Date().toISOString(),
-    hashes,
-    vectors,
+export async function readManifest(id) {
+  if (!isValidId(id)) return null;
+  const { rows } = await query(
+    `SELECT ${SUMMARY_COLUMNS}, summary, rejected, duplicates, error
+       FROM collections WHERE id = $1`,
+    [id]
+  );
+  if (!rows.length) return null;
+  const row = rows[0];
+  return {
+    ...toSummary(row),
+    summary: row.summary ?? undefined,
+    rejected: row.rejected,
+    duplicates: row.duplicates,
+    error: row.error ?? undefined,
+  };
+}
+
+/** Create the collection row in a `building` state. Returns the id. */
+export async function createCollection({ name, format, chunkStrategy }) {
+  const id = newCollectionId();
+  await query(
+    `INSERT INTO collections (id, name, format, chunk_strategy, status, counts)
+     VALUES ($1, $2, $3, $4, 'building', $5)`,
+    [
+      id,
+      name || id,
+      format,
+      chunkStrategy,
+      JSON.stringify({ rows: 0, books: 0, rejected: 0, chunks: 0 }),
+    ]
+  );
+  return id;
+}
+
+/**
+ * Merge fields into a collection's metadata.
+ *
+ * `books` is accepted here because the pipeline writes the books and the row
+ * counts in one step: they go to the books table, everything else to columns
+ * on the collection.
+ */
+export async function updateManifest(id, patch) {
+  const { books, ...meta } = patch;
+
+  const COLUMNS = {
+    name: 'name',
+    status: 'status',
+    counts: 'counts',
+    timings: 'timings',
+    summary: 'summary',
+    rejected: 'rejected',
+    duplicates: 'duplicates',
+    model: 'model',
+    dims: 'dims',
+    error: 'error',
+  };
+  const JSON_COLUMNS = new Set(['counts', 'timings', 'summary', 'rejected', 'duplicates']);
+
+  await withTransaction(async (client) => {
+    const { rowCount } = await client.query('SELECT 1 FROM collections WHERE id = $1', [id]);
+    if (!rowCount) throw new Error(`Unknown collection: ${id}`);
+
+    const sets = [];
+    const values = [];
+    for (const [key, value] of Object.entries(meta)) {
+      const column = COLUMNS[key];
+      if (!column) continue;
+      values.push(JSON_COLUMNS.has(column) ? JSON.stringify(value) : value);
+      sets.push(`${column} = $${values.length}`);
+    }
+    if (sets.length) {
+      values.push(id);
+      await client.query(
+        `UPDATE collections SET ${sets.join(', ')} WHERE id = $${values.length}`,
+        values
+      );
+    }
+
+    if (books) await replaceBooks(client, id, books);
+  });
+
+  return readManifest(id);
+}
+
+// ------------------------------------------------------------------- books
+
+/** Multi-row INSERT in slices, so one upload is a handful of round trips. */
+async function insertRows(client, sql, rows, columnsPerRow, batchSize = 200) {
+  for (let i = 0; i < rows.length; i += batchSize) {
+    const slice = rows.slice(i, i + batchSize);
+    const values = [];
+    const tuples = slice.map((row, r) => {
+      const placeholders = row.map((_, c) => `$${r * columnsPerRow + c + 1}`);
+      values.push(...row);
+      return `(${placeholders.join(', ')})`;
+    });
+    await client.query(`${sql} ${tuples.join(', ')}`, values);
+  }
+}
+
+async function replaceBooks(client, id, books) {
+  await client.query('DELETE FROM books WHERE collection_id = $1', [id]);
+  await insertRows(
+    client,
+    'INSERT INTO books (collection_id, book_id, ord, data) VALUES',
+    books.map((book, i) => [id, book.id, i, JSON.stringify(book)]),
+    4
+  );
+}
+
+/** The books of a collection, in upload order. */
+export async function readBooks(id) {
+  if (!isValidId(id)) return [];
+  const { rows } = await query(
+    'SELECT data FROM books WHERE collection_id = $1 ORDER BY ord',
+    [id]
+  );
+  return rows.map((r) => r.data);
+}
+
+/**
+ * The haystack the admin stock search matches against: title, author, reading
+ * level, then every genre and theme, space-joined -- the same string the
+ * previous in-memory filter built.
+ */
+const BOOK_HAYSTACK = `
+  lower(
+    coalesce(data->>'title', '') || ' ' ||
+    coalesce(data->>'author', '') || ' ' ||
+    coalesce(data->>'readingLevel', '') ||
+    coalesce((SELECT ' ' || string_agg(value, ' ')
+                FROM jsonb_array_elements_text(jsonb_list(data, 'genres'))), '') ||
+    coalesce((SELECT ' ' || string_agg(value, ' ')
+                FROM jsonb_array_elements_text(jsonb_list(data, 'themes'))), '')
+  )
+`;
+
+/**
+ * One page of the stock table, with both the unfiltered total and the number
+ * the search matched -- the two numbers the admin UI shows side by side.
+ *
+ * position() rather than LIKE: a reader's query can contain % or _ and those
+ * are plain characters here, not wildcards.
+ */
+export async function searchBooks(id, { q = '', offset = 0, limit = 25 } = {}) {
+  if (!isValidId(id)) return { total: 0, matched: 0, books: [] };
+
+  const needle = q.trim().toLowerCase();
+  const where = needle
+    ? `collection_id = $1 AND position($2 IN ${BOOK_HAYSTACK}) > 0`
+    : 'collection_id = $1';
+  const params = needle ? [id, needle] : [id];
+
+  const [totals, page] = await Promise.all([
+    query(
+      `SELECT (SELECT count(*) FROM books WHERE collection_id = $1) AS total,
+              (SELECT count(*) FROM books WHERE ${where}) AS matched`,
+      params
+    ),
+    query(
+      `SELECT data FROM books WHERE ${where}
+        ORDER BY ord LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+      [...params, limit, offset]
+    ),
+  ]);
+
+  return {
+    total: totals.rows[0].total,
+    matched: totals.rows[0].matched,
+    books: page.rows.map((r) => r.data),
+  };
+}
+
+// ------------------------------------------------------------------ chunks
+
+/**
+ * Store the chunk text for a collection. The hash is computed here because it
+ * is purely a function of the text, and the embed stage needs it to decide
+ * which vectors it can carry over from the live catalog.
+ */
+export async function saveChunks(id, chunks) {
+  await withTransaction(async (client) => {
+    await client.query('DELETE FROM chunks WHERE collection_id = $1', [id]);
+    await insertRows(
+      client,
+      'INSERT INTO chunks (collection_id, chunk_id, book_id, ord, kind, text, hash) VALUES',
+      chunks.map((c, i) => [id, c.chunkId, c.bookId, i, c.kind, c.text, textHash(c.text)]),
+      7
+    );
   });
 }
 
-/** The books of a collection, straight off its manifest. */
-export function readBooks(id) {
-  return readManifest(id)?.books ?? [];
+export async function countChunks(id) {
+  if (!isValidId(id)) return 0;
+  const { rows } = await query('SELECT count(*) AS n FROM chunks WHERE collection_id = $1', [id]);
+  return rows[0].n;
 }
 
-export function setActive(id) {
-  const manifest = readManifest(id);
+/** One page of chunks, in the order chunking produced them. */
+export async function readChunks(id, { offset = 0, limit = 20 } = {}) {
+  if (!isValidId(id)) return [];
+  const { rows } = await query(
+    `SELECT chunk_id, book_id, kind, text FROM chunks
+      WHERE collection_id = $1 ORDER BY ord LIMIT $2 OFFSET $3`,
+    [id, limit, offset]
+  );
+  return rows.map((r) => ({
+    chunkId: r.chunk_id,
+    bookId: r.book_id,
+    kind: r.kind,
+    text: r.text,
+  }));
+}
+
+// -------------------------------------------------------------- embeddings
+
+/**
+ * Carry vectors over from `fromId` to `toId` wherever the same chunk id still
+ * hashes to the same text.
+ *
+ * This is what keeps re-uploading the full catalog cheap. A store that adds ten
+ * titles to a five-thousand-book spreadsheet and uploads the whole thing again
+ * pays to embed twenty chunks, not ten thousand -- the other rows hash the same
+ * and their vectors carry straight over.
+ *
+ * Hashing the text is the load-bearing part: a chunk id is derived from the
+ * book id, so an edited description keeps its chunk id while very much needing
+ * a fresh vector. Matching on ids alone would silently serve a stale embedding.
+ * The source collection must also have been built with the same model and
+ * dimensionality, or its vectors are not comparable with the new ones.
+ *
+ * @returns {number} how many vectors were reused
+ */
+export async function copyReusableEmbeddings(toId, fromId, { model, dims }) {
+  if (!fromId || !isValidId(fromId) || !isValidId(toId)) return 0;
+
+  const { rowCount } = await query(
+    `UPDATE chunks AS target
+        SET embedding = source.embedding
+       FROM chunks AS source, collections AS c
+      WHERE target.collection_id = $1
+        AND source.collection_id = $2
+        AND c.id = $2
+        AND c.model = $3
+        AND c.dims = $4
+        AND source.chunk_id = target.chunk_id
+        AND source.hash = target.hash
+        AND source.embedding IS NOT NULL`,
+    [toId, fromId, model, dims]
+  );
+  return rowCount;
+}
+
+/** The chunks of a collection that still need a vector, in chunking order. */
+export async function readUnembeddedChunks(id) {
+  const { rows } = await query(
+    `SELECT chunk_id, text FROM chunks
+      WHERE collection_id = $1 AND embedding IS NULL ORDER BY ord`,
+    [id]
+  );
+  return rows.map((r) => ({ chunkId: r.chunk_id, text: r.text }));
+}
+
+/**
+ * Write freshly computed vectors.
+ * @param {{chunkId:string, vector:number[]}[]} vectors
+ */
+export async function saveEmbeddings(id, vectors, { model, dims }) {
+  await withTransaction(async (client) => {
+    for (let i = 0; i < vectors.length; i += 200) {
+      const slice = vectors.slice(i, i + 200);
+      const values = [id];
+      const tuples = slice.map(({ chunkId, vector }) => {
+        values.push(chunkId, toVectorLiteral(vector));
+        return `($${values.length - 1}::text, $${values.length}::vector)`;
+      });
+      await client.query(
+        `UPDATE chunks AS target SET embedding = v.embedding
+           FROM (VALUES ${tuples.join(', ')}) AS v(chunk_id, embedding)
+          WHERE target.collection_id = $1 AND target.chunk_id = v.chunk_id`,
+        values
+      );
+    }
+    await client.query(
+      'UPDATE collections SET model = $2, dims = $3, embeddings_built_at = now() WHERE id = $1',
+      [id, model, dims]
+    );
+  });
+}
+
+/** How many chunks of a collection carry a usable vector AND a matching book. */
+export async function countUsableEntries(id) {
+  const { rows } = await query(
+    `SELECT count(*) FILTER (WHERE c.embedding IS NOT NULL) AS embedded,
+            count(*) FILTER (WHERE c.embedding IS NOT NULL AND b.book_id IS NOT NULL) AS usable
+       FROM chunks c
+       LEFT JOIN books b ON b.collection_id = c.collection_id AND b.book_id = c.book_id
+      WHERE c.collection_id = $1`,
+    [id]
+  );
+  return { embedded: rows[0].embedded, usable: rows[0].usable };
+}
+
+// ----------------------------------------------------------------- raw file
+
+export async function saveRaw(id, filename, buffer) {
+  await query('UPDATE collections SET raw_filename = $2, raw_bytes = $3 WHERE id = $1', [
+    id,
+    filename,
+    buffer,
+  ]);
+}
+
+// --------------------------------------------------------- activate / prune
+
+export async function setActive(id) {
+  const manifest = await readManifest(id);
   if (!manifest) throw new Error(`Unknown collection: ${id}`);
   if (manifest.status !== 'ready') {
     throw new Error(`Collection ${id} is "${manifest.status}", not ready to activate`);
   }
-  const index = readIndex();
-  index.activeCollectionId = id;
-  writeIndex(index);
+  await query('UPDATE app_state SET active_collection_id = $1 WHERE id = true', [id]);
 }
 
 /**
@@ -206,33 +430,30 @@ export function setActive(id) {
  * to stay intact until the replacement is proven loadable.
  *
  * A collection that is still `building` is skipped. Activating one catalog
- * while another upload is mid-embed is entirely normal, and deleting the
- * directory out from under that job would fail its next write for reasons that
- * look nothing like the actual cause.
+ * while another upload is mid-embed is entirely normal, and deleting its rows
+ * out from under that job would fail its next write for reasons that look
+ * nothing like the actual cause.
  *
  * @returns {string[]} the ids that were removed
  */
-export function pruneExcept(keepId) {
-  const index = readIndex();
-  const keep = new Set([keepId]);
-  for (const c of index.collections) if (c.status === 'building') keep.add(c.id);
-
-  const doomed = index.collections.filter((c) => !keep.has(c.id)).map((c) => c.id);
-  for (const id of doomed) fs.rmSync(collectionDir(id), { recursive: true, force: true });
-  index.collections = index.collections.filter((c) => keep.has(c.id));
-  writeIndex(index);
-  return doomed;
+export async function pruneExcept(keepId) {
+  const { rows } = await query(
+    `DELETE FROM collections
+      WHERE id <> $1 AND status <> 'building'
+      RETURNING id`,
+    [keepId]
+  );
+  return rows.map((r) => r.id);
 }
 
-export function deleteCollection(id) {
-  const index = readIndex();
-  const manifest = readManifest(id);
+export async function deleteCollection(id) {
+  const manifest = await readManifest(id);
   if (manifest?.status === 'building') {
     const err = new Error('That upload is still building -- wait for it to finish or fail');
     err.status = 409;
     throw err;
   }
-  if (index.activeCollectionId === id) {
+  if ((await activeCollectionId()) === id) {
     const err = new Error(
       'Cannot delete the catalog that is currently serving readers. Upload a ' +
         'replacement and activate it -- that removes this one for you.'
@@ -240,7 +461,5 @@ export function deleteCollection(id) {
     err.status = 409;
     throw err;
   }
-  fs.rmSync(collectionDir(id), { recursive: true, force: true });
-  index.collections = index.collections.filter((c) => c.id !== id);
-  writeIndex(index);
+  await query('DELETE FROM collections WHERE id = $1', [id]);
 }
